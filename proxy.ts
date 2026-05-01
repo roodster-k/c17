@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 
 // Protège toutes les routes /admin avec un mot de passe simple
 // (Pas de Supabase Auth nécessaire en Phase 1)
-export function middleware(request: NextRequest): NextResponse {
+export function proxy(request: NextRequest): NextResponse {
   const { pathname } = request.nextUrl
 
   // Seules les routes /admin sont protégées
