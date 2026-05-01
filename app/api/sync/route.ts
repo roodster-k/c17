@@ -11,7 +11,6 @@ import { put } from '@vercel/blob'
 import type { SyncResult } from '@/types/database'
 import { Resend } from 'resend'
 
-const resend = new Resend(process.env.RESEND_API_KEY)
 const PRICE_ALERT_THRESHOLD = 5
 
 export async function GET(): Promise<NextResponse> {
@@ -124,6 +123,8 @@ async function sendPriceAlert(
 ): Promise<void> {
   const direction = changePct > 0 ? 'hausse' : 'baisse'
   const sign = changePct > 0 ? '+' : ''
+  if (!process.env.RESEND_API_KEY) return
+  const resend = new Resend(process.env.RESEND_API_KEY)
   try {
     await resend.emails.send({
       from: process.env.RESEND_FROM ?? 'alertes@noreply.com',
