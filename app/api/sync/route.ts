@@ -4,6 +4,8 @@ import {
   getProductByAirtableId,
   upsertProduct,
   insertPriceHistory,
+  findOrCreateGroup,
+  linkProductToGroup,
 } from '@/lib/db'
 import { calculateSellPriceCdf, calculateChangePercent } from '@/utils/price'
 import { downloadImage, getImageFilename } from '@/utils/scraping'
@@ -75,6 +77,14 @@ export async function GET(): Promise<NextResponse> {
         })
 
         result.upserted++
+
+        // Rattachement au groupe produit (pour la comparaison multi-fournisseurs)
+        try {
+          const groupId = await findOrCreateGroup(fields.Nom, fields.Categorie ?? null)
+          await linkProductToGroup(upserted.id, groupId)
+        } catch (groupErr) {
+          console.warn(`[Sync] Groupement échoué pour ${fields.Nom}:`, groupErr)
+        }
 
         // Détection variation de prix
         if (
