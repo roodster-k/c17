@@ -41,7 +41,9 @@ export default function ScrapingPage() {
     }))
 
     try {
-      const res = await fetch(`/api/scrape/${supplier}`)
+      // Sligro uses POST, others use GET
+      const method = supplier === 'sligro' ? 'POST' : 'GET'
+      const res = await fetch(`/api/scrape/${supplier}`, { method })
       const data = await res.json()
       const duration = Math.round((Date.now() - start) / 1000)
 
@@ -49,9 +51,9 @@ export default function ScrapingPage() {
         ...prev,
         [supplier]: {
           status: data.success ? 'success' : 'error',
-          productsFound: data.log?.productsFound ?? 0,
-          productsUpdated: data.log?.productsUpdated ?? 0,
-          error: data.log?.error,
+          productsFound: data.productsFound ?? data.log?.productsFound ?? 0,
+          productsUpdated: data.productsUpdated ?? data.log?.productsUpdated ?? 0,
+          error: data.error ?? data.log?.error,
           lastRun: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
           duration,
         },

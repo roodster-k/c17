@@ -1,185 +1,212 @@
-import { NextResponse } from 'next/server'
-import { extractProductsWithAI } from '@/lib/ai'
-import { findProductByReference, upsertProduct } from '@/lib/airtable'
-import { fetchWithRetry } from '@/utils/scraping'
-import type { ScrapingLog } from '@/types/database'
+/**
+ * POST /api/scrape/sligro
+ * Lance le scraping du catalogue Sligro.be
+ *
+ * Query params:
+ *   ?categoryId=001   — scraper une seule catégorie (optionnel)
+ *   ?maxProducts=100  — limite de produits par catégorie (défaut: 200)
+ */
 
-const SLIGRO_BASE_URL = 'https://www.sligro.nl'
-const SLIGRO_LOGIN_URL = 'https://www.sligro.nl/login'
+import { NextRequest, NextResponse } from 'next/server'
+import { sql, insertPriceHistory } from '@/lib/db'
+import { loginSligro, getSligroCategories, scrapeCategory } from '@/lib/scrapers/sligro'
+import { getPricingConfig } from '@/lib/pricing'
+import { Resend } from 'resend'
 
-// Catégories Sligro à scraper
-const SLIGRO_CATEGORIES = [
-  '/assortiment/dranken',
-  '/assortiment/kruidenierswaren',
-  '/assortiment/zuivel-eieren-boter',
-  '/assortiment/diepvries',
-  '/assortiment/snacks-koek-chips',
-]
+export const dynamic = 'force-dynamic'
 
-async function loginSligro(): Promise<string> {
-  const email = process.env.SLIGRO_EMAIL
-  const password = process.env.SLIGRO_PASSWORD
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  const startTime = Date.now()
+  const { searchParams } = new URL(req.url)
+  const targetCategoryId = searchParams.get('categoryId')
+  const maxProducts = parseInt(searchParams.get('maxProducts') ?? '200', 10)
 
-  if (!email || !password) {
-    throw new Error('SLIGRO_EMAIL et SLIGRO_PASSWORD manquants dans .env.local')
-  }
-
-  // Récupération du token CSRF depuis la page de login
-  const loginPageRes = await fetchWithRetry(SLIGRO_LOGIN_URL)
-  const loginPageHtml = await loginPageRes.text()
-
-  // Extraction du token CSRF (hidden input)
-  const csrfMatch = loginPageHtml.match(/name="_token"\s+value="([^"]+)"/)
-  const csrfToken = csrfMatch?.[1] ?? ''
-
-  // Récupération des cookies initiaux
-  const initialCookies = loginPageRes.headers.get('set-cookie') ?? ''
-
-  // POST de connexion
-  const loginRes = await fetch(SLIGRO_LOGIN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Cookie: initialCookies,
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
-      Referer: SLIGRO_LOGIN_URL,
-    },
-    body: new URLSearchParams({
-      _token: csrfToken,
-      email,
-      password,
-    }).toString(),
-    redirect: 'manual',
-  })
-
-  const sessionCookie = loginRes.headers.get('set-cookie')
-  if (!sessionCookie) {
-    throw new Error('Sligro : échec de connexion — aucun cookie de session reçu')
-  }
-
-  // Extrait uniquement la valeur du cookie de session
-  const sessionMatch = sessionCookie.match(/sligro_session=[^;]+/)
-  if (!sessionMatch) {
-    throw new Error('Sligro : cookie de session introuvable dans la réponse')
-  }
-
-  return sessionMatch[0]
-}
-
-export async function GET(): Promise<NextResponse> {
-  const log: ScrapingLog = {
-    supplier: 'sligro',
-    status: 'running',
-    productsFound: 0,
-    productsUpdated: 0,
-    startedAt: new Date().toISOString(),
-  }
+  const logId = await startScrapingLog('sligro')
+  let productsFound = 0
+  let productsUpdated = 0
+  const errors: string[] = []
 
   try {
-    // Authentification
-    let sessionCookie: string
-    try {
-      sessionCookie = await loginSligro()
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      log.status = 'error'
-      log.error = `Authentification Sligro échouée : ${message}`
-      log.finishedAt = new Date().toISOString()
-      return NextResponse.json({ success: false, log }, { status: 500 })
-    }
+    // 1. Login
+    console.log('[Sligro] Login...')
+    const { accessToken, houseId } = await loginSligro()
+    console.log('[Sligro] ✓ Connecté')
 
-    let totalFound = 0
-    let totalUpdated = 0
+    // 2. Get categories
+    const allCategories = await getSligroCategories(accessToken)
+    const categories = targetCategoryId
+      ? allCategories.filter(c => c.id === targetCategoryId)
+      : allCategories
+    console.log(`[Sligro] ${categories.length} catégorie(s) à scraper`)
 
-    for (const categoryPath of SLIGRO_CATEGORIES) {
-      const url = `${SLIGRO_BASE_URL}${categoryPath}`
-      let page = 1
+    // 3. Pricing config
+    const pricingConfig = await getPricingConfig()
+    const supplierConfig = await sql`
+      SELECT frais_achat_pct FROM supplier_configs WHERE supplier = 'sligro' LIMIT 1
+    `
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fraisAchatPct = parseFloat((supplierConfig[0] as any)?.frais_achat_pct ?? '10')
 
-      // Parcours de toutes les pages de la catégorie
-      while (true) {
-        const pageUrl = page === 1 ? url : `${url}?page=${page}`
+    // 4. Scrape each category
+    for (const category of categories) {
+      console.log(`[Sligro] Scraping catégorie [${category.id}] ${category.name}...`)
 
-        let html: string
-        try {
-          const res = await fetchWithRetry(pageUrl, {
-            headers: { Cookie: sessionCookie },
-          })
-          html = await res.text()
-
-          // Si la page redirige vers le login → session expirée
-          if (html.includes('login') && html.includes('password')) {
-            throw new Error('Session Sligro expirée pendant le scraping')
-          }
-        } catch (err) {
-          console.error(`[Sligro] Erreur fetch ${pageUrl}:`, err)
-          break
-        }
-
-        // Extraction via Claude API
-        let products
-        try {
-          products = await extractProductsWithAI(html, 'Sligro', SLIGRO_BASE_URL)
-        } catch (err) {
-          console.error(`[Sligro] Erreur Claude pour ${pageUrl}:`, err)
-          break
-        }
-
-        if (products.length === 0) break // Plus de produits → fin de pagination
-
-        totalFound += products.length
+      try {
+        const products = await scrapeCategory(accessToken, category, houseId, maxProducts)
+        productsFound += products.length
+        console.log(`[Sligro]   → ${products.length} produits trouvés`)
 
         for (const product of products) {
           try {
-            if (!product.nom || !product.reference) continue
+            const existing = await getProductBySligroCode(product.code)
+            const buyPriceEur = product.priceEur
 
-            const existing = await findProductByReference(product.reference, 'Sligro')
-
-            let imageAttachment: Array<{ url: string }> | undefined
-            if (product.url_image) {
-              imageAttachment = [{ url: product.url_image }]
+            // Calcul prix de vente
+            let sellPriceCdf: number | null = null
+            if (buyPriceEur !== null) {
+              const fraisAchat = buyPriceEur * (fraisAchatPct / 100)
+              const poids = 0.5
+              const fret = poids * pricingConfig.fret_par_kg
+              const totalEur = buyPriceEur + fraisAchat + fret
+              sellPriceCdf = Math.round(totalEur * pricingConfig.taux_eur_cdf)
             }
 
-            await upsertProduct(
-              {
-                Nom: product.nom,
-                Fournisseur: 'Sligro',
-                Reference: product.reference,
-                Prix_Achat_EUR: product.prix_eur,
-                Categorie: product.categorie,
-                URL_Source: product.url_source || pageUrl,
-                Derniere_MAJ: new Date().toISOString().split('T')[0],
-                ...(imageAttachment ? { Image: imageAttachment } : {}),
-              },
-              existing?.id
-            )
+            const upserted = await upsertSligroProduct({
+              sligro_code: product.code,
+              name: product.name,
+              brand: product.brand,
+              supplier: 'sligro',
+              reference: product.code,
+              category: product.categoryName,
+              buy_price_eur: buyPriceEur,
+              sell_price_cdf: sellPriceCdf,
+              margin_pct: fraisAchatPct,
+              content_description: product.contentDescription,
+              source_url: product.sourceUrl,
+              active: product.purchasable,
+            })
 
-            totalUpdated++
-          } catch (err) {
-            console.error(`[Sligro] Erreur upsert ${product.reference}:`, err)
+            // Price change detection
+            if (existing && existing.buy_price_eur !== null && buyPriceEur !== null) {
+              const changePct = Math.abs((buyPriceEur - existing.buy_price_eur) / existing.buy_price_eur) * 100
+              if (changePct > 0.01) {
+                await insertPriceHistory({
+                  product_id: upserted.id,
+                  old_price: existing.buy_price_eur,
+                  new_price: buyPriceEur,
+                  change_pct: Math.round(changePct * 100) / 100,
+                })
+                if (changePct >= pricingConfig.price_alert_threshold_pct) {
+                  await sendPriceAlert(product.name, existing.buy_price_eur, buyPriceEur, changePct, 'sligro')
+                }
+              }
+            }
+
+            productsUpdated++
+          } catch (productErr) {
+            const msg = productErr instanceof Error ? productErr.message : String(productErr)
+            errors.push(`[${product.code}] ${msg}`)
           }
         }
-
-        // Vérifie s'il existe une page suivante
-        const hasNextPage = html.includes(`page=${page + 1}`) || html.includes('rel="next"')
-        if (!hasNextPage) break
-        page++
+      } catch (catErr) {
+        const msg = catErr instanceof Error ? catErr.message : String(catErr)
+        errors.push(`[Cat ${category.id}] ${msg}`)
+        console.error(`[Sligro] Erreur catégorie ${category.id}:`, msg)
       }
     }
 
-    log.status = 'success'
-    log.productsFound = totalFound
-    log.productsUpdated = totalUpdated
-    log.finishedAt = new Date().toISOString()
+    const duration = Math.round((Date.now() - startTime) / 1000)
+    await finishScrapingLog(logId, 'success', productsFound, productsUpdated)
+    console.log(`[Sligro] ✓ Terminé en ${duration}s`)
 
-    return NextResponse.json({ success: true, log })
+    return NextResponse.json({
+      success: true,
+      productsFound,
+      productsUpdated,
+      errors: errors.slice(0, 20),
+      durationSeconds: duration,
+    })
+
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    log.status = 'error'
-    log.error = message
-    log.finishedAt = new Date().toISOString()
-
-    console.error('[Sligro] Erreur critique:', message)
-    return NextResponse.json({ success: false, log }, { status: 500 })
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[Sligro] Erreur critique:', msg)
+    await finishScrapingLog(logId, 'error', productsFound, productsUpdated, msg)
+    return NextResponse.json({ success: false, error: msg, productsFound, productsUpdated }, { status: 500 })
   }
+}
+
+export async function GET(req: NextRequest): Promise<NextResponse> {
+  return POST(req)
+}
+
+// ─── DB helpers ────────────────────────────────────────────
+
+async function getProductBySligroCode(code: string) {
+  const rows = await sql`SELECT id, buy_price_eur FROM products WHERE sligro_code = ${code} LIMIT 1`
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (rows[0] as any) ?? null
+}
+
+async function upsertSligroProduct(data: {
+  sligro_code: string; name: string; brand: string | null; supplier: string
+  reference: string; category: string; buy_price_eur: number | null; sell_price_cdf: number | null
+  margin_pct: number; content_description: string; source_url: string; active: boolean
+}) {
+  const rows = await sql`
+    INSERT INTO products (
+      sligro_code, name, brand, supplier, reference, category,
+      buy_price_eur, sell_price_cdf, margin_pct,
+      content_description, source_url, active, updated_at
+    ) VALUES (
+      ${data.sligro_code}, ${data.name}, ${data.brand ?? null}, ${data.supplier},
+      ${data.reference}, ${data.category},
+      ${data.buy_price_eur}, ${data.sell_price_cdf}, ${data.margin_pct},
+      ${data.content_description}, ${data.source_url}, ${data.active}, now()
+    )
+    ON CONFLICT (sligro_code) DO UPDATE SET
+      name                = EXCLUDED.name,
+      brand               = EXCLUDED.brand,
+      category            = EXCLUDED.category,
+      buy_price_eur       = EXCLUDED.buy_price_eur,
+      sell_price_cdf      = EXCLUDED.sell_price_cdf,
+      content_description = EXCLUDED.content_description,
+      source_url          = EXCLUDED.source_url,
+      active              = EXCLUDED.active,
+      updated_at          = now()
+    RETURNING id, buy_price_eur
+  `
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return rows[0] as any
+}
+
+async function startScrapingLog(supplier: string): Promise<string> {
+  const rows = await sql`
+    INSERT INTO scraping_logs (supplier, status, started_at)
+    VALUES (${supplier}, 'running', now()) RETURNING id
+  `
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (rows[0] as any).id
+}
+
+async function finishScrapingLog(id: string, status: string, found: number, updated: number, error?: string) {
+  await sql`
+    UPDATE scraping_logs
+    SET status = ${status}, products_found = ${found}, products_updated = ${updated},
+        error = ${error ?? null}, finished_at = now()
+    WHERE id = ${id}
+  `
+}
+
+async function sendPriceAlert(name: string, oldPrice: number, newPrice: number, changePct: number, supplier: string) {
+  if (!process.env.RESEND_API_KEY || !process.env.ALERT_EMAIL) return
+  const resend = new Resend(process.env.RESEND_API_KEY)
+  const direction = newPrice > oldPrice ? '🔴 hausse' : '🟢 baisse'
+  try {
+    await resend.emails.send({
+      from: 'C17 Alerts <alerts@c17.pro>',
+      to: process.env.ALERT_EMAIL,
+      subject: `Alerte prix ${supplier}: ${name} ${direction} ${changePct.toFixed(1)}%`,
+      html: `<p><b>${name}</b> chez <b>${supplier}</b></p><p>Ancien: €${oldPrice.toFixed(2)} → Nouveau: €${newPrice.toFixed(2)}</p><p>Variation: <b>${direction} ${changePct.toFixed(1)}%</b></p>`,
+    })
+  } catch {}
 }
