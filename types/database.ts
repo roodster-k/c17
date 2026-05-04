@@ -76,11 +76,3 @@ export interface ScrapingLog {
   startedAt: string
   finishedAt?: string
 }
-
-export interface SyncResult {
-  upserted: number
-  priceChanges: number
-  imagesUploaded: number
-  errors: string[]
-  duration: number
-}

@@ -1,7 +1,13 @@
-import { NextRequest, NextResponse } from 'next/server'
-import type { ScrapingLog } from '@/types/database'
+/**
+ * GET /api/cron/scrape-all
+ * Déclenché automatiquement par Cloudflare Cron Triggers (wrangler.toml).
+ * Lance les 3 scrapers en parallèle.
+ */
 
-// Protège l'endpoint avec CRON_SECRET
+import { NextRequest, NextResponse } from 'next/server'
+
+export const dynamic = 'force-dynamic'
+
 function isAuthorized(request: NextRequest): boolean {
   const authHeader = request.headers.get('authorization')
   return authHeader === `Bearer ${process.env.CRON_SECRET}`
@@ -12,78 +18,46 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'Non autorisé' }, { status: 401 })
   }
 
-  const baseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-    ? new URL(request.url).origin
-    : 'http://localhost:3000'
+  const origin = new URL(request.url).origin
+  const startedAt = new Date().toISOString()
+  console.log('[Cron] Démarrage scraping complet —', startedAt)
 
-  const logs: ScrapingLog[] = []
+  // Lance les 3 scrapers en parallèle
+  const results = await Promise.allSettled([
+    fetch(`${origin}/api/scrape/colruyt`).then(r => r.json()),
+    fetch(`${origin}/api/scrape/sligro`, { method: 'POST' }).then(r => r.json()),
+    fetch(`${origin}/api/scrape/nespresso`).then(r => r.json()),
+  ])
+
+  const suppliers = ['colruyt', 'sligro', 'nespresso']
   const errors: string[] = []
+  let totalFound = 0
+  let totalUpdated = 0
 
-  console.log('[Cron] Démarrage du scraping complet —', new Date().toISOString())
-
-  // 1. Scraping Colruyt
-  try {
-    const colruytRes = await fetch(`${baseUrl}/api/scrape/colruyt`, {
-      headers: { Cookie: request.headers.get('cookie') ?? '' },
-    })
-    const colruytData = await colruytRes.json()
-    if (colruytData.log) logs.push(colruytData.log)
-    if (!colruytData.success) errors.push(`Colruyt: ${colruytData.log?.error ?? 'Erreur inconnue'}`)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    errors.push(`Colruyt: ${msg}`)
-    console.error('[Cron] Colruyt échoué:', msg)
-  }
-
-  // 2. Scraping Sligro
-  try {
-    const sligroRes = await fetch(`${baseUrl}/api/scrape/sligro`, {
-      headers: { Cookie: request.headers.get('cookie') ?? '' },
-    })
-    const sligroData = await sligroRes.json()
-    if (sligroData.log) logs.push(sligroData.log)
-    if (!sligroData.success) errors.push(`Sligro: ${sligroData.log?.error ?? 'Erreur inconnue'}`)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    errors.push(`Sligro: ${msg}`)
-    console.error('[Cron] Sligro échoué:', msg)
-  }
-
-  // 3. Scraping Nespresso
-  try {
-    const nespressoRes = await fetch(`${baseUrl}/api/scrape/nespresso`, {
-      headers: { Cookie: request.headers.get('cookie') ?? '' },
-    })
-    const nespressoData = await nespressoRes.json()
-    if (nespressoData.log) logs.push(nespressoData.log)
-    if (!nespressoData.success)
-      errors.push(`Nespresso: ${nespressoData.log?.error ?? 'Erreur inconnue'}`)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    errors.push(`Nespresso: ${msg}`)
-    console.error('[Cron] Nespresso échoué:', msg)
-  }
-
-  // 4. Synchronisation Airtable → Supabase
-  try {
-    const syncRes = await fetch(`${baseUrl}/api/sync`)
-    const syncData = await syncRes.json()
-    if (!syncData.success) {
-      errors.push(`Sync: ${syncData.result?.errors?.join(', ') ?? 'Erreur inconnue'}`)
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i]
+    const supplier = suppliers[i]
+    if (result.status === 'fulfilled') {
+      const data = result.value as { success: boolean; productsFound?: number; productsUpdated?: number; error?: string }
+      totalFound += data.productsFound ?? 0
+      totalUpdated += data.productsUpdated ?? 0
+      if (!data.success) errors.push(`${supplier}: ${data.error ?? 'Erreur inconnue'}`)
+      console.log(`[Cron] ${supplier}: ${data.productsFound ?? 0} trouvés, ${data.productsUpdated ?? 0} mis à jour`)
+    } else {
+      errors.push(`${supplier}: ${result.reason}`)
+      console.error(`[Cron] ${supplier} échoué:`, result.reason)
     }
-    console.log('[Cron] Sync terminée:', syncData.result)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    errors.push(`Sync: ${msg}`)
-    console.error('[Cron] Sync échouée:', msg)
   }
 
-  console.log('[Cron] Scraping complet terminé —', new Date().toISOString())
+  const completedAt = new Date().toISOString()
+  console.log(`[Cron] ✓ Terminé — ${totalFound} trouvés, ${totalUpdated} mis à jour, ${errors.length} erreur(s)`)
 
   return NextResponse.json({
     success: errors.length === 0,
-    logs,
+    totalFound,
+    totalUpdated,
     errors,
-    completedAt: new Date().toISOString(),
+    startedAt,
+    completedAt,
   })
 }

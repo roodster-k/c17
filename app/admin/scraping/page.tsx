@@ -27,10 +27,6 @@ export default function ScrapingPage() {
     sligro: { status: 'idle', productsFound: 0, productsUpdated: 0 },
     nespresso: { status: 'idle', productsFound: 0, productsUpdated: 0 },
   })
-  const [syncState, setSyncState] = useState<{
-    status: RunStatus
-    result?: { upserted: number; priceChanges: number; imagesUploaded: number; errors: string[] }
-  }>({ status: 'idle' })
   const [allRunning, setAllRunning] = useState(false)
 
   async function runScraper(supplier: Supplier) {
@@ -41,7 +37,6 @@ export default function ScrapingPage() {
     }))
 
     try {
-      // Sligro uses POST, others use GET
       const method = supplier === 'sligro' ? 'POST' : 'GET'
       const res = await fetch(`/api/scrape/${supplier}`, { method })
       const data = await res.json()
@@ -51,9 +46,9 @@ export default function ScrapingPage() {
         ...prev,
         [supplier]: {
           status: data.success ? 'success' : 'error',
-          productsFound: data.productsFound ?? data.log?.productsFound ?? 0,
-          productsUpdated: data.productsUpdated ?? data.log?.productsUpdated ?? 0,
-          error: data.error ?? data.log?.error,
+          productsFound: data.productsFound ?? 0,
+          productsUpdated: data.productsUpdated ?? 0,
+          error: data.error,
           lastRun: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }),
           duration,
         },
@@ -72,23 +67,10 @@ export default function ScrapingPage() {
     }
   }
 
-  async function runSync() {
-    setSyncState({ status: 'running' })
-    try {
-      const res = await fetch('/api/sync')
-      const data = await res.json()
-      setSyncState({ status: data.success ? 'success' : 'error', result: data.result })
-    } catch (err) {
-      setSyncState({ status: 'error' })
-    }
-  }
-
   async function runAll() {
     setAllRunning(true)
-    for (const s of SUPPLIERS) {
-      await runScraper(s.key)
-    }
-    await runSync()
+    // Lance les 3 scrapers en parallèle
+    await Promise.all(SUPPLIERS.map((s) => runScraper(s.key)))
     setAllRunning(false)
   }
 
@@ -112,7 +94,7 @@ export default function ScrapingPage() {
           <div>
             <h1 className="text-2xl font-bold text-white">Scraping</h1>
             <p className="text-gray-400 text-sm mt-1">
-              Gérez les scrapings fournisseurs et la synchronisation
+              Gérez les scrapings fournisseurs — les 3 sites tournent en parallèle
             </p>
           </div>
 
@@ -192,58 +174,14 @@ export default function ScrapingPage() {
           })}
         </div>
 
-        {/* Synchronisation */}
-        <div className="bg-gray-900 rounded-2xl border border-gray-800 p-6">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              {STATUS_ICON[syncState.status]}
-              <h2 className="font-semibold text-white">Synchronisation Airtable → Supabase</h2>
-            </div>
-            <button
-              onClick={runSync}
-              disabled={syncState.status === 'running' || allRunning}
-              className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-50
-                         text-white text-xs font-medium rounded-lg transition"
-            >
-              {syncState.status === 'running' ? 'En cours...' : 'Lancer sync'}
-            </button>
-          </div>
-
-          {syncState.result && (
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
-              <div>
-                <p className="text-gray-500 text-xs">Produits synchronisés</p>
-                <p className="text-white font-semibold text-lg">{syncState.result.upserted}</p>
-              </div>
-              <div>
-                <p className="text-gray-500 text-xs">Variations de prix</p>
-                <p className="text-yellow-400 font-semibold text-lg">{syncState.result.priceChanges}</p>
-              </div>
-              <div>
-                <p className="text-gray-500 text-xs">Images uploadées</p>
-                <p className="text-blue-400 font-semibold text-lg">{syncState.result.imagesUploaded}</p>
-              </div>
-              <div>
-                <p className="text-gray-500 text-xs">Erreurs</p>
-                <p className={`font-semibold text-lg ${syncState.result.errors.length > 0 ? 'text-red-400' : 'text-green-400'}`}>
-                  {syncState.result.errors.length}
-                </p>
-              </div>
-              {syncState.result.errors.length > 0 && (
-                <div className="col-span-4 mt-2 p-3 bg-red-950 rounded-lg">
-                  <p className="text-red-400 text-xs">{syncState.result.errors.slice(0, 3).join(' | ')}</p>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
         {/* Info cron */}
         <div className="mt-4 p-4 bg-gray-800/50 rounded-xl border border-gray-700">
           <p className="text-gray-400 text-sm">
             <span className="text-gray-200 font-medium">Cron automatique :</span>{' '}
-            Le scraping complet est déclenché automatiquement toutes les 6h par Vercel Cron
-            (configuré dans <code className="text-blue-400">vercel.json</code>).
+            Le scraping complet est déclenché automatiquement toutes les 6h par{' '}
+            <span className="text-orange-400 font-medium">Cloudflare Cron Triggers</span>{' '}
+            (configuré dans <code className="text-blue-400">wrangler.toml</code>).
+            Les 3 fournisseurs tournent en parallèle.
           </p>
         </div>
       </div>

@@ -1,12 +1,12 @@
 import { NextResponse } from 'next/server'
 import { extractProductsWithAI } from '@/lib/ai'
-import { findProductByReference, upsertProduct } from '@/lib/airtable'
-import { fetchWithRetry, downloadImage, getImageFilename } from '@/utils/scraping'
-import type { ScrapingLog } from '@/types/database'
+import { sql, upsertProductByRef, insertPriceHistory } from '@/lib/db'
+import { getPricingConfig } from '@/lib/pricing'
+import { fetchWithRetry } from '@/utils/scraping'
+import { Resend } from 'resend'
 
 const COLRUYT_BASE_URL = 'https://www.colruyt.be'
 
-// URLs des catégories Colruyt pertinentes pour le projet Congo
 const COLRUYT_CATEGORIES = [
   '/fr/alimentation/boissons',
   '/fr/alimentation/epicerie',
@@ -14,18 +14,22 @@ const COLRUYT_CATEGORIES = [
   '/fr/alimentation/surgelés',
 ]
 
+export const dynamic = 'force-dynamic'
+
 export async function GET(): Promise<NextResponse> {
-  const log: ScrapingLog = {
-    supplier: 'colruyt',
-    status: 'running',
-    productsFound: 0,
-    productsUpdated: 0,
-    startedAt: new Date().toISOString(),
-  }
+  const startTime = Date.now()
+  const logId = await startScrapingLog('colruyt')
+  let productsFound = 0
+  let productsUpdated = 0
+  const errors: string[] = []
 
   try {
-    let totalFound = 0
-    let totalUpdated = 0
+    const pricingConfig = await getPricingConfig()
+    const supplierConfig = await sql`
+      SELECT frais_achat_pct FROM supplier_configs WHERE supplier = 'colruyt' LIMIT 1
+    `
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fraisAchatPct = parseFloat((supplierConfig[0] as any)?.frais_achat_pct ?? '10')
 
     for (const categoryPath of COLRUYT_CATEGORIES) {
       const url = `${COLRUYT_BASE_URL}${categoryPath}`
@@ -35,72 +39,117 @@ export async function GET(): Promise<NextResponse> {
         const res = await fetchWithRetry(url)
         html = await res.text()
       } catch (err) {
-        console.error(`[Colruyt] Erreur fetch ${url}:`, err)
+        errors.push(`Fetch ${categoryPath}: ${err instanceof Error ? err.message : String(err)}`)
         continue
       }
 
-      // Extraction des produits via Claude API
       let products
       try {
         products = await extractProductsWithAI(html, 'Colruyt', COLRUYT_BASE_URL)
       } catch (err) {
-        console.error(`[Colruyt] Erreur Claude pour ${categoryPath}:`, err)
+        errors.push(`AI ${categoryPath}: ${err instanceof Error ? err.message : String(err)}`)
         continue
       }
 
-      totalFound += products.length
+      productsFound += products.length
 
-      // Écriture dans Airtable
       for (const product of products) {
         try {
           if (!product.nom || !product.reference) continue
 
-          const existing = await findProductByReference(product.reference, 'Colruyt')
+          const buyPriceEur: number | null = product.prix_eur ?? null
+          let sellPriceCdf: number | null = null
 
-          // Téléchargement de l'image si présente
-          let imageAttachment: Array<{ url: string }> | undefined
-          if (product.url_image) {
-            try {
-              imageAttachment = [{ url: product.url_image }]
-            } catch {
-              // Image non critique, on continue
+          if (buyPriceEur !== null) {
+            const totalEur = buyPriceEur * (1 + fraisAchatPct / 100) + 0.5 * pricingConfig.fret_par_kg
+            sellPriceCdf = Math.round(totalEur * pricingConfig.taux_eur_cdf)
+          }
+
+          const { id, previousBuyPriceEur, isNew } = await upsertProductByRef({
+            name: product.nom,
+            supplier: 'colruyt',
+            reference: product.reference,
+            category: product.categorie ?? null,
+            buy_price_eur: buyPriceEur,
+            sell_price_cdf: sellPriceCdf,
+            margin_pct: fraisAchatPct,
+            image_url: product.url_image ?? null,
+            source_url: product.url_source ?? url,
+            active: true,
+          })
+
+          // Détection variation de prix
+          if (!isNew && previousBuyPriceEur !== null && buyPriceEur !== null) {
+            const changePct = Math.abs((buyPriceEur - previousBuyPriceEur) / previousBuyPriceEur) * 100
+            if (changePct > 0.01) {
+              await insertPriceHistory({
+                product_id: id,
+                old_price: previousBuyPriceEur,
+                new_price: buyPriceEur,
+                change_pct: Math.round(changePct * 100) / 100,
+              })
+              if (changePct >= pricingConfig.price_alert_threshold_pct) {
+                await sendPriceAlert(product.nom, previousBuyPriceEur, buyPriceEur, changePct, 'colruyt')
+              }
             }
           }
 
-          await upsertProduct(
-            {
-              Nom: product.nom,
-              Fournisseur: 'Colruyt',
-              Reference: product.reference,
-              Prix_Achat_EUR: product.prix_eur,
-              Categorie: product.categorie,
-              URL_Source: product.url_source || url,
-              Derniere_MAJ: new Date().toISOString().split('T')[0],
-              ...(imageAttachment ? { Image: imageAttachment } : {}),
-            },
-            existing?.id
-          )
-
-          totalUpdated++
+          productsUpdated++
         } catch (err) {
-          console.error(`[Colruyt] Erreur upsert produit ${product.reference}:`, err)
+          errors.push(`[${product.reference}] ${err instanceof Error ? err.message : String(err)}`)
         }
       }
     }
 
-    log.status = 'success'
-    log.productsFound = totalFound
-    log.productsUpdated = totalUpdated
-    log.finishedAt = new Date().toISOString()
+    const duration = Math.round((Date.now() - startTime) / 1000)
+    await finishScrapingLog(logId, 'success', productsFound, productsUpdated)
+    console.log(`[Colruyt] ✓ Terminé en ${duration}s — ${productsFound} trouvés, ${productsUpdated} mis à jour`)
 
-    return NextResponse.json({ success: true, log })
+    return NextResponse.json({
+      success: true,
+      productsFound,
+      productsUpdated,
+      errors: errors.slice(0, 20),
+      durationSeconds: duration,
+    })
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    log.status = 'error'
-    log.error = message
-    log.finishedAt = new Date().toISOString()
-
-    console.error('[Colruyt] Erreur critique:', message)
-    return NextResponse.json({ success: false, log }, { status: 500 })
+    const msg = err instanceof Error ? err.message : String(err)
+    await finishScrapingLog(logId, 'error', productsFound, productsUpdated, msg)
+    console.error('[Colruyt] Erreur critique:', msg)
+    return NextResponse.json({ success: false, error: msg, productsFound, productsUpdated }, { status: 500 })
   }
+}
+
+// ─── DB helpers ────────────────────────────────────────────
+
+async function startScrapingLog(supplier: string): Promise<string> {
+  const rows = await sql`
+    INSERT INTO scraping_logs (supplier, status, started_at)
+    VALUES (${supplier}, 'running', now()) RETURNING id
+  `
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (rows[0] as any).id
+}
+
+async function finishScrapingLog(id: string, status: string, found: number, updated: number, error?: string) {
+  await sql`
+    UPDATE scraping_logs
+    SET status = ${status}, products_found = ${found}, products_updated = ${updated},
+        error = ${error ?? null}, finished_at = now()
+    WHERE id = ${id}
+  `
+}
+
+async function sendPriceAlert(name: string, oldPrice: number, newPrice: number, changePct: number, supplier: string) {
+  if (!process.env.RESEND_API_KEY || !process.env.ALERT_EMAIL) return
+  const resend = new Resend(process.env.RESEND_API_KEY)
+  const direction = newPrice > oldPrice ? '🔴 hausse' : '🟢 baisse'
+  try {
+    await resend.emails.send({
+      from: 'C17 Alerts <alerts@c17.pro>',
+      to: process.env.ALERT_EMAIL,
+      subject: `Alerte prix ${supplier}: ${name} ${direction} ${changePct.toFixed(1)}%`,
+      html: `<p><b>${name}</b> chez <b>${supplier}</b></p><p>Ancien: €${oldPrice.toFixed(2)} → Nouveau: €${newPrice.toFixed(2)}</p><p>Variation: <b>${direction} ${changePct.toFixed(1)}%</b></p>`,
+    })
+  } catch { /* alertes non critiques */ }
 }

@@ -42,49 +42,60 @@ export async function getProductById(id: string): Promise<Product | null> {
   return (rows[0] as Product) ?? null
 }
 
-export async function getProductByAirtableId(airtableId: string): Promise<Product | null> {
-  const rows = await sql`SELECT * FROM products WHERE airtable_id = ${airtableId} LIMIT 1`
-  return (rows[0] as Product) ?? null
-}
-
-export async function upsertProduct(data: {
+/**
+ * Upsert un produit par (supplier, reference).
+ * Retourne l'id du produit + l'ancien prix (null si nouveau produit).
+ */
+export async function upsertProductByRef(data: {
   name: string
-  supplier: string | null
-  reference: string | null
+  supplier: string
+  reference: string
   category: string | null
-  buy_price_eur: number
+  buy_price_eur: number | null
+  sell_price_cdf: number | null
   margin_pct: number
-  sell_price_cdf: number
   image_url: string | null
   source_url: string | null
   active: boolean
-  airtable_id: string
-}): Promise<Product> {
+}): Promise<{ id: string; previousBuyPriceEur: number | null; isNew: boolean }> {
+  // Lookup by supplier + reference (no unique constraint, so we do SELECT first)
+  const existing = await sql`
+    SELECT id, buy_price_eur FROM products
+    WHERE supplier = ${data.supplier} AND reference = ${data.reference}
+    LIMIT 1
+  `
+
+  if (existing.length > 0) {
+    const row = existing[0] as { id: string; buy_price_eur: number | null }
+    await sql`
+      UPDATE products SET
+        name           = ${data.name},
+        category       = ${data.category},
+        buy_price_eur  = ${data.buy_price_eur},
+        sell_price_cdf = ${data.sell_price_cdf},
+        margin_pct     = ${data.margin_pct},
+        image_url      = ${data.image_url},
+        source_url     = ${data.source_url},
+        active         = ${data.active},
+        updated_at     = now()
+      WHERE id = ${row.id}
+    `
+    return { id: row.id, previousBuyPriceEur: row.buy_price_eur, isNew: false }
+  }
+
   const rows = await sql`
     INSERT INTO products (
       name, supplier, reference, category,
-      buy_price_eur, margin_pct, sell_price_cdf,
-      image_url, source_url, active, airtable_id, updated_at
+      buy_price_eur, sell_price_cdf, margin_pct,
+      image_url, source_url, active, updated_at
     ) VALUES (
       ${data.name}, ${data.supplier}, ${data.reference}, ${data.category},
-      ${data.buy_price_eur}, ${data.margin_pct}, ${data.sell_price_cdf},
-      ${data.image_url}, ${data.source_url}, ${data.active}, ${data.airtable_id}, now()
+      ${data.buy_price_eur}, ${data.sell_price_cdf}, ${data.margin_pct},
+      ${data.image_url}, ${data.source_url}, ${data.active}, now()
     )
-    ON CONFLICT (airtable_id) DO UPDATE SET
-      name           = EXCLUDED.name,
-      supplier       = EXCLUDED.supplier,
-      reference      = EXCLUDED.reference,
-      category       = EXCLUDED.category,
-      buy_price_eur  = EXCLUDED.buy_price_eur,
-      margin_pct     = EXCLUDED.margin_pct,
-      sell_price_cdf = EXCLUDED.sell_price_cdf,
-      image_url      = EXCLUDED.image_url,
-      source_url     = EXCLUDED.source_url,
-      active         = EXCLUDED.active,
-      updated_at     = now()
-    RETURNING *
+    RETURNING id
   `
-  return rows[0] as Product
+  return { id: (rows[0] as { id: string }).id, previousBuyPriceEur: null, isNew: true }
 }
 
 export async function updateProduct(id: string, data: Partial<{
