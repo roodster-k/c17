@@ -7,17 +7,17 @@ import { Resend } from 'resend'
 
 const COLRUYT_BASE_URL = 'https://www.colruyt.be'
 
-const COLRUYT_CATEGORIES = [
-  '/fr/alimentation/boissons',
-  '/fr/alimentation/epicerie',
-  '/fr/alimentation/produits-frais',
-  '/fr/alimentation/surgelés',
-]
+// On utilise le catalogue général paginé au lieu de catégories fixes
+// ?page=N retourne ~24 produits par page
+const MAX_PRODUCTS = 50
 
 export const dynamic = 'force-dynamic'
 
-export async function GET(): Promise<NextResponse> {
+export async function GET(req: Request): Promise<NextResponse> {
   const startTime = Date.now()
+  const { searchParams } = new URL(req.url)
+  const maxProducts = parseInt(searchParams.get('maxProducts') ?? String(MAX_PRODUCTS), 10)
+
   const logId = await startScrapingLog('colruyt')
   let productsFound = 0
   let productsUpdated = 0
@@ -31,15 +31,18 @@ export async function GET(): Promise<NextResponse> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const fraisAchatPct = parseFloat((supplierConfig[0] as any)?.frais_achat_pct ?? '10')
 
-    for (const categoryPath of COLRUYT_CATEGORIES) {
-      const url = `${COLRUYT_BASE_URL}${categoryPath}`
+    const pagesToFetch = Math.ceil(maxProducts / 24) + 1
+
+    for (let page = 1; page <= pagesToFetch && productsUpdated < maxProducts; page++) {
+      const url = `${COLRUYT_BASE_URL}/fr/produits?page=${page}`
+      console.log(`[Colruyt] Fetching page ${page}...`)
 
       let html: string
       try {
         const res = await fetchWithRetry(url)
         html = await res.text()
       } catch (err) {
-        errors.push(`Fetch ${categoryPath}: ${err instanceof Error ? err.message : String(err)}`)
+        errors.push(`Fetch page ${page}: ${err instanceof Error ? err.message : String(err)}`)
         continue
       }
 
@@ -47,21 +50,26 @@ export async function GET(): Promise<NextResponse> {
       try {
         products = await extractProductsWithAI(html, 'Colruyt', COLRUYT_BASE_URL)
       } catch (err) {
-        errors.push(`AI ${categoryPath}: ${err instanceof Error ? err.message : String(err)}`)
+        errors.push(`AI page ${page}: ${err instanceof Error ? err.message : String(err)}`)
         continue
       }
 
+      console.log(`[Colruyt] Page ${page}: ${products.length} produits extraits par Gemini`)
       productsFound += products.length
 
       for (const product of products) {
+        if (productsUpdated >= maxProducts) break
         try {
           if (!product.nom || !product.reference) continue
 
-          const buyPriceEur: number | null = product.prix_eur ?? null
+          const buyPriceEur: number | null = product.prix_eur > 0 ? product.prix_eur : null
           let sellPriceCdf: number | null = null
+          const poidsKg = product.poids_kg ?? 0.5  // défaut 0.5kg si inconnu
 
           if (buyPriceEur !== null) {
-            const totalEur = buyPriceEur * (1 + fraisAchatPct / 100) + 0.5 * pricingConfig.fret_par_kg
+            const fraisAchat = buyPriceEur * (fraisAchatPct / 100)
+            const fret = poidsKg * pricingConfig.fret_par_kg
+            const totalEur = buyPriceEur + fraisAchat + fret
             sellPriceCdf = Math.round(totalEur * pricingConfig.taux_eur_cdf)
           }
 
@@ -69,13 +77,17 @@ export async function GET(): Promise<NextResponse> {
             name: product.nom,
             supplier: 'colruyt',
             reference: product.reference,
-            category: product.categorie ?? null,
+            category: product.categorie || null,
             buy_price_eur: buyPriceEur,
             sell_price_cdf: sellPriceCdf,
             margin_pct: fraisAchatPct,
-            image_url: product.url_image ?? null,
-            source_url: product.url_source ?? url,
+            image_url: product.url_image || null,
+            source_url: product.url_source || url,
             active: true,
+            brand: product.brand || null,
+            content_description: product.content_description || null,
+            poids_kg: product.poids_kg ?? null,
+            unite: product.unite || null,
           })
 
           // Détection variation de prix

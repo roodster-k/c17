@@ -23,6 +23,8 @@ export interface SligroProduct {
   salesUnit: string
   purchasable: boolean
   sourceUrl: string
+  imageUrl: string | null
+  poidsKg: number | null
 }
 
 // ─── Auth ──────────────────────────────────────────────────
@@ -196,12 +198,14 @@ export async function scrapeCategory(
     // Merge prices into products
     for (const product of products) {
       const priceData = prices[product.code]
+      const contentDesc = priceData?.contentDescription || product.contentDescription
       allProducts.push({
         ...product,
         priceEur: priceData?.price ?? null,
-        contentDescription: priceData?.contentDescription || product.contentDescription,
+        contentDescription: contentDesc,
         salesUnit: priceData?.salesUnit || product.salesUnit,
         purchasable: priceData?.purchasable ?? true,
+        poidsKg: product.poidsKg ?? parsePoidsKg(contentDesc),
       })
     }
 
@@ -243,6 +247,8 @@ interface ParsedProduct {
   categoryName: string
   purchasable: boolean
   priceEur: null
+  imageUrl: string | null
+  poidsKg: number | null
 }
 
 function extractProductsFromHtml(
@@ -252,29 +258,32 @@ function extractProductsFromHtml(
 ): { products: ParsedProduct[]; hasMore: boolean } {
   const products: ParsedProduct[] = []
 
-  // Extract products by pattern: data-code="XXXXX"
-  // Pattern around data-code: <div ... data-code="123456" ...>...<div class="cmp-productoverview-product-info-name">NAME
-  const productRegex = /data-code="(\d{4,7})"[^>]*>([\s\S]*?)(?=data-code="\d{4,7}"|<\/div>\s*<\/div>\s*<\/div>\s*<\/section>|$)/g
+  // Each product block starts with data-code="XXXXX"
+  // We split the page into per-product blocks first, then parse each
+  const productRegex = /data-code="(\d{4,7})"[^>]*>([\s\S]*?)(?=data-code="\d{4,7}"|<\/section>|$)/g
   let match
 
   while ((match = productRegex.exec(html)) !== null) {
     const code = match[1]
     const block = match[2]
 
-    // Extract name from info-name div
-    const nameMatch = block.match(/cmp-productoverview-product-info-name[^>]*>([\s\S]*?)<\/div>/)
-    const rawName = nameMatch ? cleanText(nameMatch[1]) : ''
+    // ── Brand (dedicated anchor element)
+    const brandMatch = block.match(/class="[^"]*cmp-productoverview-product-info-name__brand[^"]*"[^>]*>([\s\S]*?)<\/a>/)
+    const brand = brandMatch ? cleanText(brandMatch[1]) : ''
 
-    // Brand is usually first line, product name is second
-    const nameLines = rawName.split('\n').map(l => l.trim()).filter(l => l.length > 0)
-    const brand = nameLines[0] || ''
-    const name = nameLines.slice(1).join(' ').trim() || brand
+    // ── Product name (h5 inside the name anchor)
+    const nameMatch = block.match(/class="[^"]*cmp-productoverview-product-info-name__name[^"]*"[^>]*>[\s\S]*?<h5[^>]*>([\s\S]*?)<\/h5>/)
+    const name = nameMatch ? cleanText(nameMatch[1]) : brand
 
-    // Extract content description
-    const descMatch = block.match(/cmp-productoverview-product-info-content-description[^>]*>([\s\S]*?)<\/div>/)
+    // ── Image URL (sligro image-service CDN)
+    const imgMatch = block.match(/src="(https:\/\/www\.sligro\.be\/fr\/image-service\/[^"]+)"/)
+    const imageUrl = imgMatch ? imgMatch[1] : null
+
+    // ── Content description (weight/volume/pack info)
+    const descMatch = block.match(/class="[^"]*cmp-productoverview-product-info-content-description[^"]*"[^>]*>([\s\S]*?)<\/div>/)
     const contentDescription = descMatch ? cleanText(descMatch[1]) : ''
 
-    // Extract product URL
+    // ── Product detail URL
     const urlMatch = block.match(/href="(\/fr\/p\.[^"]+)"/)
     const sourceUrl = urlMatch ? BASE + urlMatch[1] : `${BASE}/fr/c.${category.id}.html`
 
@@ -290,11 +299,13 @@ function extractProductsFromHtml(
         categoryName: category.name,
         purchasable: true,
         priceEur: null,
+        imageUrl,
+        poidsKg: parsePoidsKg(contentDescription),
       })
     }
   }
 
-  // Check if there's a next page (pagination or load-more)
+  // Check if there's a next page
   const hasMore = html.includes(`currentPage=${page + 1}`) ||
     html.includes('cmp-productoverview--next') ||
     (products.length >= 24 && !html.includes('no-more-products'))
@@ -361,6 +372,50 @@ async function getProductPrices(
 }
 
 // ─── Helpers ───────────────────────────────────────────────
+
+/**
+ * Parse a content description string and returns weight in kg.
+ * Examples: "500g" → 0.5 | "1.5kg" → 1.5 | "6x33cl" → 0.198 | "1L" → 1.0 | "250ml" → 0.25
+ */
+export function parsePoidsKg(desc: string): number | null {
+  if (!desc) return null
+  const s = desc.toLowerCase().trim()
+
+  // kg: "1.5kg", "2 kg"
+  const kgMatch = s.match(/(\d+(?:[.,]\d+)?)\s*kg/)
+  if (kgMatch) return parseFloat(kgMatch[1].replace(',', '.'))
+
+  // g: "500g", "250 g"
+  const gMatch = s.match(/(\d+(?:[.,]\d+)?)\s*g(?!al)/)
+  if (gMatch) return parseFloat(gMatch[1].replace(',', '.')) / 1000
+
+  // L: "1l", "1.5 l", "1L"
+  const lMatch = s.match(/(\d+(?:[.,]\d+)?)\s*l(?!b)(?:iter|itre)?(?:\b|$)/)
+  if (lMatch) return parseFloat(lMatch[1].replace(',', '.'))
+
+  // cl: "33cl" → 0.33L
+  const clMatch = s.match(/(\d+(?:[.,]\d+)?)\s*cl/)
+  if (clMatch) return parseFloat(clMatch[1].replace(',', '.')) / 100
+
+  // ml: "250ml" → 0.25L
+  const mlMatch = s.match(/(\d+(?:[.,]\d+)?)\s*ml/)
+  if (mlMatch) return parseFloat(mlMatch[1].replace(',', '.')) / 1000
+
+  // packs: "6x33cl" → 6 * 0.33 = 1.98 — use the last unit found after "x"
+  const packMatch = s.match(/(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(kg|g|l|cl|ml)/)
+  if (packMatch) {
+    const qty = parseInt(packMatch[1])
+    const val = parseFloat(packMatch[2].replace(',', '.'))
+    const unit = packMatch[3]
+    if (unit === 'kg') return qty * val
+    if (unit === 'g') return qty * val / 1000
+    if (unit === 'l') return qty * val
+    if (unit === 'cl') return qty * val / 100
+    if (unit === 'ml') return qty * val / 1000
+  }
+
+  return null
+}
 
 function cleanText(html: string): string {
   return html

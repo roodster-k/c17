@@ -84,6 +84,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
               content_description: product.contentDescription,
               source_url: product.sourceUrl,
               active: product.purchasable,
+              image_url: product.imageUrl ?? null,
+              poids_kg: product.poidsKg ?? null,
+              unite: product.salesUnit || null,
             })
 
             // Price change detection
@@ -151,17 +154,20 @@ async function upsertSligroProduct(data: {
   sligro_code: string; name: string; brand: string | null; supplier: string
   reference: string; category: string; buy_price_eur: number | null; sell_price_cdf: number | null
   margin_pct: number; content_description: string; source_url: string; active: boolean
+  image_url: string | null; poids_kg: number | null; unite: string | null
 }) {
   const rows = await sql`
     INSERT INTO products (
       sligro_code, name, brand, supplier, reference, category,
       buy_price_eur, sell_price_cdf, margin_pct,
-      content_description, source_url, active, updated_at
+      content_description, source_url, active,
+      image_url, poids_kg, unite, updated_at
     ) VALUES (
       ${data.sligro_code}, ${data.name}, ${data.brand ?? null}, ${data.supplier},
       ${data.reference}, ${data.category},
       ${data.buy_price_eur}, ${data.sell_price_cdf}, ${data.margin_pct},
-      ${data.content_description}, ${data.source_url}, ${data.active}, now()
+      ${data.content_description}, ${data.source_url}, ${data.active},
+      ${data.image_url}, ${data.poids_kg}, ${data.unite}, now()
     )
     ON CONFLICT (sligro_code) DO UPDATE SET
       name                = EXCLUDED.name,
@@ -172,6 +178,9 @@ async function upsertSligroProduct(data: {
       content_description = EXCLUDED.content_description,
       source_url          = EXCLUDED.source_url,
       active              = EXCLUDED.active,
+      image_url           = EXCLUDED.image_url,
+      poids_kg            = COALESCE(EXCLUDED.poids_kg, products.poids_kg),
+      unite               = COALESCE(EXCLUDED.unite, products.unite),
       updated_at          = now()
     RETURNING id, buy_price_eur
   `

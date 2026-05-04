@@ -57,6 +57,10 @@ export async function upsertProductByRef(data: {
   image_url: string | null
   source_url: string | null
   active: boolean
+  brand?: string | null
+  content_description?: string | null
+  poids_kg?: number | null
+  unite?: string | null
 }): Promise<{ id: string; previousBuyPriceEur: number | null; isNew: boolean }> {
   // Lookup by supplier + reference (no unique constraint, so we do SELECT first)
   const existing = await sql`
@@ -65,19 +69,28 @@ export async function upsertProductByRef(data: {
     LIMIT 1
   `
 
+  const brand = data.brand ?? null
+  const contentDescription = data.content_description ?? null
+  const poidsKg = data.poids_kg ?? null
+  const unite = data.unite ?? null
+
   if (existing.length > 0) {
     const row = existing[0] as { id: string; buy_price_eur: number | null }
     await sql`
       UPDATE products SET
-        name           = ${data.name},
-        category       = ${data.category},
-        buy_price_eur  = ${data.buy_price_eur},
-        sell_price_cdf = ${data.sell_price_cdf},
-        margin_pct     = ${data.margin_pct},
-        image_url      = ${data.image_url},
-        source_url     = ${data.source_url},
-        active         = ${data.active},
-        updated_at     = now()
+        name                = ${data.name},
+        category            = ${data.category},
+        buy_price_eur       = ${data.buy_price_eur},
+        sell_price_cdf      = ${data.sell_price_cdf},
+        margin_pct          = ${data.margin_pct},
+        image_url           = ${data.image_url},
+        source_url          = ${data.source_url},
+        active              = ${data.active},
+        brand               = COALESCE(${brand}, brand),
+        content_description = COALESCE(${contentDescription}, content_description),
+        poids_kg            = COALESCE(${poidsKg}, poids_kg),
+        unite               = COALESCE(${unite}, unite),
+        updated_at          = now()
       WHERE id = ${row.id}
     `
     return { id: row.id, previousBuyPriceEur: row.buy_price_eur, isNew: false }
@@ -87,11 +100,15 @@ export async function upsertProductByRef(data: {
     INSERT INTO products (
       name, supplier, reference, category,
       buy_price_eur, sell_price_cdf, margin_pct,
-      image_url, source_url, active, updated_at
+      image_url, source_url, active,
+      brand, content_description, poids_kg, unite,
+      updated_at
     ) VALUES (
       ${data.name}, ${data.supplier}, ${data.reference}, ${data.category},
       ${data.buy_price_eur}, ${data.sell_price_cdf}, ${data.margin_pct},
-      ${data.image_url}, ${data.source_url}, ${data.active}, now()
+      ${data.image_url}, ${data.source_url}, ${data.active},
+      ${brand}, ${contentDescription}, ${poidsKg}, ${unite},
+      now()
     )
     RETURNING id
   `
