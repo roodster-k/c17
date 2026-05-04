@@ -328,7 +328,10 @@ async function getProductPrices(
         `${BASE}/api/cart/${STORE_ID}/customerorganizationdatas?productCodes=${codesParam}&mainHouseId=${houseId}`,
         {
           headers: {
+            // Sligro requires token BOTH as Bearer AND as cookie for price access
             'Authorization': `Bearer ${token}`,
+            'Cookie': `access_token=${token}`,
+            'x-sligro-language': LANG,
             'Accept': 'application/json',
           }
         }
