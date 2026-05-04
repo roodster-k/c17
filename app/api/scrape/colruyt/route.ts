@@ -1,22 +1,65 @@
+/**
+ * GET /api/scrape/colruyt
+ *
+ * Scraper Colruyt.be utilisant l'API interne officielle (découverte par analyse réseau).
+ * API endpoint : apip.colruyt.be/gateway/ictmgmt.emarkecom.cgproductretrsvc.v2/v2/v2/fr/products
+ * Clé API : extraite du HTML global vars → X-CG-APIKey
+ *
+ * La clé API est publique (intégrée dans le JS du site) et requiert Origin: https://www.colruyt.be
+ *
+ * Query params:
+ *   ?maxProducts=50   — limite de produits (défaut: 50)
+ *   ?page=1           — page de départ (défaut: 1)
+ */
+
 import { NextResponse } from 'next/server'
-import { extractProductsWithAI } from '@/lib/ai'
 import { sql, upsertProductByRef, insertPriceHistory } from '@/lib/db'
 import { getPricingConfig } from '@/lib/pricing'
-import { fetchWithRetry } from '@/utils/scraping'
+import { parsePoidsKg } from '@/lib/scrapers/sligro'
 import { Resend } from 'resend'
 
-const COLRUYT_BASE_URL = 'https://www.colruyt.be'
+const COLRUYT_API_KEY = 'a8ylmv13-b285-4788-9e14-0f79b7ed2411'
+const COLRUYT_API_BASE = 'https://apip.colruyt.be/gateway/ictmgmt.emarkecom.cgproductretrsvc.v2/v2/v2/fr'
+const COLRUYT_IMAGE_BASE = 'https://static.colruytgroup.com/images/500x500'
+const PAGE_SIZE = 24
 
-// On utilise le catalogue général paginé au lieu de catégories fixes
-// ?page=N retourne ~24 produits par page
-const MAX_PRODUCTS = 50
+const COLRUYT_HEADERS = {
+  'X-CG-APIKey': COLRUYT_API_KEY,
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'fr-BE,fr;q=0.9,en;q=0.8',
+  'Origin': 'https://www.colruyt.be',
+  'Referer': 'https://www.colruyt.be/fr/produits',
+  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Sec-Fetch-Dest': 'empty',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'same-site',
+}
+
+interface ColruytApiProduct {
+  productId: string
+  technicalArticleNumber: string
+  name: string
+  brand: string
+  thumbNail: string
+  fullImage: string
+  content: string          // ex: "500g", "1L", "6x33cl"
+  topCategoryName: string
+  topCategoryId: string
+  amount: number           // poids/volume numérique
+  amountUnit: string       // "kg", "l", etc.
+  OrderUnit: string        // "P" = pièce, "K" = kilo...
+  LongName: string
+  IsBio: boolean
+  nutriscoreLabel?: string
+}
 
 export const dynamic = 'force-dynamic'
 
 export async function GET(req: Request): Promise<NextResponse> {
   const startTime = Date.now()
   const { searchParams } = new URL(req.url)
-  const maxProducts = parseInt(searchParams.get('maxProducts') ?? String(MAX_PRODUCTS), 10)
+  const maxProducts = parseInt(searchParams.get('maxProducts') ?? '50', 10)
+  const startPage = parseInt(searchParams.get('page') ?? '1', 10)
 
   const logId = await startScrapingLog('colruyt')
   let productsFound = 0
@@ -31,66 +74,73 @@ export async function GET(req: Request): Promise<NextResponse> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const fraisAchatPct = parseFloat((supplierConfig[0] as any)?.frais_achat_pct ?? '10')
 
-    const pagesToFetch = Math.ceil(maxProducts / 24) + 1
+    let page = startPage
 
-    for (let page = 1; page <= pagesToFetch && productsUpdated < maxProducts; page++) {
-      const url = `${COLRUYT_BASE_URL}/fr/produits?page=${page}`
-      console.log(`[Colruyt] Fetching page ${page}...`)
+    while (productsUpdated < maxProducts) {
+      const url = `${COLRUYT_API_BASE}/products?page=${page}&size=${PAGE_SIZE}&clientCode=CLP`
+      console.log(`[Colruyt] Fetching page ${page} (${productsUpdated}/${maxProducts} products)...`)
 
-      let html: string
+      let apiData: { productsFound: number; products: ColruytApiProduct[] }
       try {
-        const res = await fetchWithRetry(url)
-        html = await res.text()
+        const res = await fetch(url, { headers: COLRUYT_HEADERS })
+        if (!res.ok) {
+          const body = await res.text()
+          errors.push(`API page ${page}: HTTP ${res.status} — ${body.slice(0, 200)}`)
+          break
+        }
+        apiData = await res.json()
       } catch (err) {
         errors.push(`Fetch page ${page}: ${err instanceof Error ? err.message : String(err)}`)
-        continue
+        break
       }
 
-      let products
-      try {
-        products = await extractProductsWithAI(html, 'Colruyt', COLRUYT_BASE_URL)
-      } catch (err) {
-        errors.push(`AI page ${page}: ${err instanceof Error ? err.message : String(err)}`)
-        continue
-      }
+      const pageProducts = apiData.products ?? []
+      if (pageProducts.length === 0) break
 
-      console.log(`[Colruyt] Page ${page}: ${products.length} produits extraits par Gemini`)
-      productsFound += products.length
+      console.log(`[Colruyt] Page ${page}: ${pageProducts.length} produits`)
+      productsFound += pageProducts.length
 
-      for (const product of products) {
+      for (const product of pageProducts) {
         if (productsUpdated >= maxProducts) break
         try {
-          if (!product.nom || !product.reference) continue
+          const reference = product.technicalArticleNumber || product.productId
+          if (!product.name || !reference) continue
 
-          const buyPriceEur: number | null = product.prix_eur > 0 ? product.prix_eur : null
-          let sellPriceCdf: number | null = null
-          const poidsKg = product.poids_kg ?? 0.5  // défaut 0.5kg si inconnu
+          // Calcul poids en kg
+          const poidsKg = product.amount && product.amountUnit
+            ? convertToKg(product.amount, product.amountUnit)
+            : parsePoidsKg(product.content ?? '')
 
-          if (buyPriceEur !== null) {
-            const fraisAchat = buyPriceEur * (fraisAchatPct / 100)
-            const fret = poidsKg * pricingConfig.fret_par_kg
-            const totalEur = buyPriceEur + fraisAchat + fret
-            sellPriceCdf = Math.round(totalEur * pricingConfig.taux_eur_cdf)
-          }
+          // Prix non disponible sans auth → null (calculé lors de la mise à jour manuelle)
+          const buyPriceEur: number | null = null
+          const sellPriceCdf: number | null = null
+
+          // Image : préférer fullImage (500x500), sinon thumbNail
+          const imageUrl = product.fullImage || product.thumbNail || null
+
+          // Unité de vente
+          const unite = product.OrderUnit === 'K' ? 'kg'
+            : product.OrderUnit === 'P' ? 'pièce'
+            : product.OrderUnit || null
 
           const { id, previousBuyPriceEur, isNew } = await upsertProductByRef({
-            name: product.nom,
+            name: product.LongName || product.name,
             supplier: 'colruyt',
-            reference: product.reference,
-            category: product.categorie || null,
+            reference,
+            category: product.topCategoryName || null,
             buy_price_eur: buyPriceEur,
             sell_price_cdf: sellPriceCdf,
             margin_pct: fraisAchatPct,
-            image_url: product.url_image || null,
-            source_url: product.url_source || url,
+            image_url: imageUrl,
+            source_url: `https://www.colruyt.be/fr/produits/${reference}`,
             active: true,
             brand: product.brand || null,
-            content_description: product.content_description || null,
-            poids_kg: product.poids_kg ?? null,
-            unite: product.unite || null,
+            content_description: product.content || null,
+            poids_kg: poidsKg,
+            unite,
           })
 
-          // Détection variation de prix
+          // Détection variation de prix (si prix disponible)
           if (!isNew && previousBuyPriceEur !== null && buyPriceEur !== null) {
             const changePct = Math.abs((buyPriceEur - previousBuyPriceEur) / previousBuyPriceEur) * 100
             if (changePct > 0.01) {
@@ -101,16 +151,20 @@ export async function GET(req: Request): Promise<NextResponse> {
                 change_pct: Math.round(changePct * 100) / 100,
               })
               if (changePct >= pricingConfig.price_alert_threshold_pct) {
-                await sendPriceAlert(product.nom, previousBuyPriceEur, buyPriceEur, changePct, 'colruyt')
+                await sendPriceAlert(product.name, previousBuyPriceEur, buyPriceEur, changePct, 'colruyt')
               }
             }
           }
 
           productsUpdated++
         } catch (err) {
-          errors.push(`[${product.reference}] ${err instanceof Error ? err.message : String(err)}`)
+          errors.push(`[${product.productId}] ${err instanceof Error ? err.message : String(err)}`)
         }
       }
+
+      // Stop if fewer products than page size (last page)
+      if (pageProducts.length < PAGE_SIZE) break
+      page++
     }
 
     const duration = Math.round((Date.now() - startTime) / 1000)
@@ -130,6 +184,18 @@ export async function GET(req: Request): Promise<NextResponse> {
     console.error('[Colruyt] Erreur critique:', msg)
     return NextResponse.json({ success: false, error: msg, productsFound, productsUpdated }, { status: 500 })
   }
+}
+
+// ─── Helpers ───────────────────────────────────────────────
+
+function convertToKg(amount: number, unit: string): number | null {
+  const u = (unit ?? '').toLowerCase()
+  if (u === 'kg' || u === 'k') return amount
+  if (u === 'g') return amount / 1000
+  if (u === 'l' || u === 'liter' || u === 'litre') return amount  // L ≈ kg pour l'eau
+  if (u === 'cl') return amount / 100
+  if (u === 'ml') return amount / 1000
+  return null
 }
 
 // ─── DB helpers ────────────────────────────────────────────
